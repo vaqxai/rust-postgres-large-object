@@ -249,39 +249,39 @@ mod test {
 
     use crate::{LargeObjectExt, LargeObjectTransactionExt, Mode};
 
+    const DB_URL: &str = "postgres://postgres:postgres@localhost";
+
     #[test]
     fn test_create_delete() {
-        let mut conn = Client::connect("postgres://postgres:postgres@localhost", NoTls).unwrap();
+        let mut conn = Client::connect(DB_URL, NoTls).unwrap();
         let oid = conn.create_large_object().unwrap();
         conn.delete_large_object(oid).unwrap();
     }
 
-    const UNDEFINED_OBJECT: postgres::error::SqlState = SqlState::UNDEFINED_OBJECT;
-
     #[test]
     fn test_delete_bogus() {
-        let mut conn = Client::connect("postgres://postgres:postgres@localhost", NoTls).unwrap();
+        let mut conn = Client::connect(DB_URL, NoTls).unwrap();
         match conn.delete_large_object(0) {
             Ok(()) => panic!("unexpected success"),
-            Err(ref e) if e.code() == Some(&UNDEFINED_OBJECT) => {}
+            Err(ref e) if e.code() == Some(&SqlState::UNDEFINED_OBJECT) => {}
             Err(e) => panic!("unexpected error: {:?}", e),
         }
     }
 
     #[test]
     fn test_open_bogus() {
-        let mut conn = Client::connect("postgres://postgres:postgres@localhost", NoTls).unwrap();
+        let mut conn = Client::connect(DB_URL, NoTls).unwrap();
         let mut trans = conn.transaction().unwrap();
         match trans.open_large_object(0, Mode::Read) {
             Ok(_) => panic!("unexpected success"),
-            Err(ref e) if e.code() == Some(&UNDEFINED_OBJECT) => {}
+            Err(ref e) if e.code() == Some(&SqlState::UNDEFINED_OBJECT) => {}
             Err(e) => panic!("unexpected error: {:?}", e),
         };
     }
 
     #[test]
     fn test_open_finish() {
-        let mut conn = Client::connect("postgres://postgres:postgres@localhost", NoTls).unwrap();
+        let mut conn = Client::connect(DB_URL, NoTls).unwrap();
         let mut trans = conn.transaction().unwrap();
         let oid = trans.create_large_object().unwrap();
         let lo = trans.open_large_object(oid, Mode::Read).unwrap();
@@ -292,7 +292,7 @@ mod test {
     fn test_write_read() {
         use std::io::{Read, Write};
 
-        let mut conn = Client::connect("postgres://postgres:postgres@localhost", NoTls).unwrap();
+        let mut conn = Client::connect(DB_URL, NoTls).unwrap();
         let mut trans = conn.transaction().unwrap();
         let oid = trans.create_large_object().unwrap();
         {
@@ -309,7 +309,7 @@ mod test {
     fn test_seek_tell() {
         use std::io::{Read, Seek, SeekFrom, Write};
 
-        let mut conn = Client::connect("postgres://postgres:postgres@localhost", NoTls).unwrap();
+        let mut conn = Client::connect(DB_URL, NoTls).unwrap();
         let mut trans = conn.transaction().unwrap();
         let oid = trans.create_large_object().unwrap();
         let mut lo = trans.open_large_object(oid, Mode::Write).unwrap();
@@ -333,7 +333,7 @@ mod test {
     fn test_write_with_read_fd() {
         use std::io::Write;
 
-        let mut conn = Client::connect("postgres://postgres:postgres@localhost", NoTls).unwrap();
+        let mut conn = Client::connect(DB_URL, NoTls).unwrap();
         let mut trans = conn.transaction().unwrap();
         let oid = trans.create_large_object().unwrap();
         let mut lo = trans.open_large_object(oid, Mode::Read).unwrap();
@@ -344,7 +344,7 @@ mod test {
     fn test_truncate() {
         use std::io::{Read, Seek, SeekFrom, Write};
 
-        let mut conn = Client::connect("postgres://postgres:postgres@localhost", NoTls).unwrap();
+        let mut conn = Client::connect(DB_URL, NoTls).unwrap();
         let mut trans = conn.transaction().unwrap();
         let oid = trans.create_large_object().unwrap();
         let mut lo = trans.open_large_object(oid, Mode::Write).unwrap();
