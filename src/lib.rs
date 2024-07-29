@@ -9,14 +9,14 @@
 //! use std::fs::File;
 //! use std::io;
 //!
-//! use postgres::{Connection, TlsMode};
+//! use postgres::{Client, NoTls};
 //! use postgres_large_object::{LargeObjectExt, LargeObjectTransactionExt, Mode};
 //!
 //! fn main() {
-//!     let conn = Connection::connect("postgres://postgres@localhost", TlsMode::None).unwrap();
+//!     let mut conn = Client::connect("postgres://postgres:postgres@localhost", NoTls).unwrap();
 //!
 //!     let mut file = File::open("vacation_photos.tar.gz").unwrap();
-//!     let trans = conn.transaction().unwrap();
+//!     let mut trans = conn.transaction().unwrap();
 //!     let oid = trans.create_large_object().unwrap();
 //!     {
 //!         let mut large_object = trans.open_large_object(oid, Mode::Write).unwrap();
@@ -25,7 +25,7 @@
 //!     trans.commit().unwrap();
 //!
 //!     let mut file = File::create("vacation_photos_copy.tar.gz").unwrap();
-//!     let trans = conn.transaction().unwrap();
+//!     let mut trans = conn.transaction().unwrap();
 //!     let mut large_object = trans.open_large_object(oid, Mode::Read).unwrap();
 //!     io::copy(&mut large_object, &mut file).unwrap();
 //! }
@@ -34,9 +34,10 @@
 
 extern crate postgres;
 
-use postgres::{GenericConnection, Result};
-use postgres::transaction::Transaction;
 use postgres::types::Oid;
+use postgres::Error;
+use postgres::GenericClient;
+use postgres::Transaction;
 use std::cmp;
 use std::fmt;
 use std::i32;
@@ -45,22 +46,22 @@ use std::io::{self, Write};
 /// An extension trait adding functionality to create and delete large objects.
 pub trait LargeObjectExt {
     /// Creates a new large object, returning its `Oid`.
-    fn create_large_object(&self) -> Result<Oid>;
+    fn create_large_object(&mut self) -> Result<Oid, Error>;
 
     /// Deletes the large object with the specified `Oid`.
-    fn delete_large_object(&self, oid: Oid) -> Result<()>;
+    fn delete_large_object(&mut self, oid: Oid) -> Result<(), Error>;
 }
 
-impl<T: GenericConnection> LargeObjectExt for T {
-    fn create_large_object(&self) -> Result<Oid> {
-        let stmt = self.prepare_cached("SELECT pg_catalog.lo_create(0)")?;
-        let r = stmt.query(&[]).map(|r| r.iter().next().unwrap().get(0));
+impl<T: GenericClient> LargeObjectExt for T {
+    fn create_large_object(&mut self) -> Result<Oid, Error> {
+        let stmt = self.prepare("SELECT pg_catalog.lo_create(0)")?;
+        let r = self.query_one(&stmt, &[]).map(|r| r.get(0));
         r
     }
 
-    fn delete_large_object(&self, oid: Oid) -> Result<()> {
-        let stmt = self.prepare_cached("SELECT pg_catalog.lo_unlink($1)")?;
-        stmt.execute(&[&oid]).map(|_| ())
+    fn delete_large_object(&mut self, oid: Oid) -> Result<(), Error> {
+        let stmt = self.prepare("SELECT pg_catalog.lo_unlink($1)")?;
+        self.execute(&stmt, &[&oid]).map(|_| ())
     }
 }
 
@@ -89,19 +90,24 @@ impl Mode {
 }
 
 /// An extension trait adding functionality to open large objects.
-pub trait LargeObjectTransactionExt {
+pub trait LargeObjectTransactionExt<'conn> {
     /// Opens the large object with the specified `Oid` in the specified `Mode`.
-    fn open_large_object<'a>(&'a self, oid: Oid, mode: Mode) -> Result<LargeObject<'a>>;
+    fn open_large_object<'b>(
+        &'b mut self,
+        oid: Oid,
+        mode: Mode,
+    ) -> Result<LargeObject<'conn, 'b>, Error>;
 }
 
-impl<'conn> LargeObjectTransactionExt for Transaction<'conn> {
-    fn open_large_object<'a>(&'a self, oid: Oid, mode: Mode) -> Result<LargeObject<'a>> {
-        let version = self.connection().parameter("server_version").unwrap();
-        let (major, minor) = parse_version(&version);
-        let has_64 = major > 9 || (major == 9 && minor >= 3);
-
-        let stmt = self.prepare_cached("SELECT pg_catalog.lo_open($1, $2)")?;
-        let fd = stmt.query(&[&oid, &mode.to_i32()])?
+impl<'conn> LargeObjectTransactionExt<'conn> for Transaction<'conn> {
+    fn open_large_object<'b>(
+        &'b mut self,
+        oid: Oid,
+        mode: Mode,
+    ) -> Result<LargeObject<'conn, 'b>, Error> {
+        let stmt = self.prepare("SELECT pg_catalog.lo_open($1, $2)")?;
+        let fd = self
+            .query(&stmt, &[&oid, &mode.to_i32()])?
             .iter()
             .next()
             .unwrap()
@@ -109,36 +115,34 @@ impl<'conn> LargeObjectTransactionExt for Transaction<'conn> {
         Ok(LargeObject {
             trans: self,
             fd: fd,
-            has_64: has_64,
             finished: false,
         })
     }
 }
 
 /// Represents an open large object.
-pub struct LargeObject<'a> {
-    trans: &'a Transaction<'a>,
+pub struct LargeObject<'conn, 'b> {
+    trans: &'b mut Transaction<'conn>,
     fd: i32,
-    has_64: bool,
     finished: bool,
 }
 
-impl<'a> fmt::Debug for LargeObject<'a> {
+impl<'a, 'b> fmt::Debug for LargeObject<'a, 'b> {
     fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
         fmt.debug_struct("LargeObject")
             .field("fd", &self.fd)
-            .field("transaction", &self.trans)
+            .field("finished", &self.finished)
             .finish()
     }
 }
 
-impl<'a> Drop for LargeObject<'a> {
+impl<'a, 'b> Drop for LargeObject<'a, 'b> {
     fn drop(&mut self) {
         let _ = self.finish_inner();
     }
 }
 
-impl<'a> LargeObject<'a> {
+impl<'a, 'b> LargeObject<'a, 'b> {
     /// Returns the file descriptor of the opened object.
     pub fn fd(&self) -> i32 {
         self.fd
@@ -148,62 +152,58 @@ impl<'a> LargeObject<'a> {
     ///
     /// If `len` is larger than the size of the object, it will be padded with
     /// null bytes to the specified size.
-    pub fn truncate(&mut self, len: i64) -> Result<()> {
-        if self.has_64 {
-            let stmt = self.trans
-                .prepare_cached("SELECT pg_catalog.lo_truncate64($1, $2)")?;
-            stmt.execute(&[&self.fd, &len]).map(|_| ())
-        } else {
-            let len = if len <= i32::max_value() as i64 {
-                len as i32
-            } else {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "The database does not support objects larger \
-                     than 2GB",
-                ).into());
-            };
-            let stmt = self.trans
-                .prepare_cached("SELECT pg_catalog.lo_truncate($1, $2)")?;
-            stmt.execute(&[&self.fd, &len]).map(|_| ())
-        }
+    pub fn truncate(&mut self, len: i64) -> Result<(), Error> {
+        let stmt = self
+            .trans
+            .prepare("SELECT pg_catalog.lo_truncate64($1, $2)")?;
+
+        self.trans.execute(&stmt, &[&self.fd, &len]).map(|_| ())
     }
 
-    fn finish_inner(&mut self) -> Result<()> {
+    fn finish_inner(&mut self) -> Result<(), Error> {
         if self.finished {
             return Ok(());
         }
 
         self.finished = true;
-        let stmt = self.trans.prepare_cached("SELECT pg_catalog.lo_close($1)")?;
-        stmt.execute(&[&self.fd]).map(|_| ())
+        let stmt = self.trans.prepare("SELECT pg_catalog.lo_close($1)")?;
+        self.trans.execute(&stmt, &[&self.fd]).map(|_| ())
     }
 
     /// Consumes the `LargeObject`, cleaning up server side state.
     ///
     /// Functionally identical to the `Drop` implementation on `LargeObject`
     /// except that it returns any errors to the caller.
-    pub fn finish(mut self) -> Result<()> {
+    pub fn finish(mut self) -> Result<(), Error> {
         self.finish_inner()
     }
 }
 
-impl<'a> io::Read for LargeObject<'a> {
+impl<'a, 'b> io::Read for LargeObject<'a, 'b> {
     fn read(&mut self, mut buf: &mut [u8]) -> io::Result<usize> {
-        let stmt = self.trans
-            .prepare_cached("SELECT pg_catalog.loread($1, $2)")?;
+        let stmt = self
+            .trans
+            .prepare("SELECT pg_catalog.loread($1, $2)")
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
         let cap = cmp::min(buf.len(), i32::MAX as usize) as i32;
-        let rows = stmt.query(&[&self.fd, &cap])?;
-        buf.write(rows.get(0).get_bytes(0).unwrap())
+        let rows = self
+            .trans
+            .query(&stmt, &[&self.fd, &cap])
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        buf.write(rows.get(0).unwrap().get(0))
     }
 }
 
-impl<'a> io::Write for LargeObject<'a> {
+impl<'a, 'b> io::Write for LargeObject<'a, 'b> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        let stmt = self.trans
-            .prepare_cached("SELECT pg_catalog.lowrite($1, $2)")?;
+        let stmt = self
+            .trans
+            .prepare("SELECT pg_catalog.lowrite($1, $2)")
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
         let cap = cmp::min(buf.len(), i32::MAX as usize);
-        stmt.execute(&[&self.fd, &&buf[..cap]])?;
+        self.trans
+            .execute(&stmt, &[&self.fd, &&buf[..cap]])
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
         Ok(cap)
     }
 
@@ -212,7 +212,7 @@ impl<'a> io::Write for LargeObject<'a> {
     }
 }
 
-impl<'a> io::Seek for LargeObject<'a> {
+impl<'a, 'b> io::Seek for LargeObject<'a, 'b> {
     fn seek(&mut self, pos: io::SeekFrom) -> io::Result<u64> {
         let (kind, pos) = match pos {
             io::SeekFrom::Start(pos) => {
@@ -230,55 +230,37 @@ impl<'a> io::Seek for LargeObject<'a> {
             io::SeekFrom::End(pos) => (2, pos),
         };
 
-        if self.has_64 {
-            let stmt = self.trans
-                .prepare_cached("SELECT pg_catalog.lo_lseek64($1, $2, $3)")?;
-            let rows = stmt.query(&[&self.fd, &pos, &kind])?;
-            let pos: i64 = rows.iter().next().unwrap().get(0);
-            Ok(pos as u64)
-        } else {
-            let pos = if pos <= i32::max_value() as i64 {
-                pos as i32
-            } else {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "cannot seek more than 2^31 bytes",
-                ));
-            };
-            let stmt = self.trans
-                .prepare_cached("SELECT pg_catalog.lo_lseek($1, $2, $3)")?;
-            let rows = stmt.query(&[&self.fd, &pos, &kind])?;
-            let pos: i32 = rows.iter().next().unwrap().get(0);
-            Ok(pos as u64)
-        }
+        let stmt = self
+            .trans
+            .prepare("SELECT pg_catalog.lo_lseek64($1, $2, $3)")
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        let rows = self
+            .trans
+            .query(&stmt, &[&self.fd, &pos, &kind.to_owned()])
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        let pos: i64 = rows.iter().next().unwrap().get(0);
+        Ok(pos as u64)
     }
-}
-
-fn parse_version(version: &str) -> (i32, i32) {
-    let version = version.split(' ').next().unwrap();
-    let mut version = version.split('.');
-    let major: i32 = version.next().unwrap().parse().unwrap();
-    let minor: i32 = version.next().unwrap().parse().unwrap();
-    (major, minor)
 }
 
 #[cfg(test)]
 mod test {
-    use postgres::{Connection, TlsMode};
-    use postgres::error::UNDEFINED_OBJECT;
+    use postgres::{error::SqlState, Client, NoTls};
 
-    use {parse_version, LargeObjectExt, LargeObjectTransactionExt, Mode};
+    use crate::{LargeObjectExt, LargeObjectTransactionExt, Mode};
 
     #[test]
     fn test_create_delete() {
-        let conn = Connection::connect("postgres://postgres@localhost", TlsMode::None).unwrap();
+        let mut conn = Client::connect("postgres://postgres:postgres@localhost", NoTls).unwrap();
         let oid = conn.create_large_object().unwrap();
         conn.delete_large_object(oid).unwrap();
     }
 
+    const UNDEFINED_OBJECT: postgres::error::SqlState = SqlState::UNDEFINED_OBJECT;
+
     #[test]
     fn test_delete_bogus() {
-        let conn = Connection::connect("postgres://postgres@localhost", TlsMode::None).unwrap();
+        let mut conn = Client::connect("postgres://postgres:postgres@localhost", NoTls).unwrap();
         match conn.delete_large_object(0) {
             Ok(()) => panic!("unexpected success"),
             Err(ref e) if e.code() == Some(&UNDEFINED_OBJECT) => {}
@@ -288,8 +270,8 @@ mod test {
 
     #[test]
     fn test_open_bogus() {
-        let conn = Connection::connect("postgres://postgres@localhost", TlsMode::None).unwrap();
-        let trans = conn.transaction().unwrap();
+        let mut conn = Client::connect("postgres://postgres:postgres@localhost", NoTls).unwrap();
+        let mut trans = conn.transaction().unwrap();
         match trans.open_large_object(0, Mode::Read) {
             Ok(_) => panic!("unexpected success"),
             Err(ref e) if e.code() == Some(&UNDEFINED_OBJECT) => {}
@@ -299,8 +281,8 @@ mod test {
 
     #[test]
     fn test_open_finish() {
-        let conn = Connection::connect("postgres://postgres@localhost", TlsMode::None).unwrap();
-        let trans = conn.transaction().unwrap();
+        let mut conn = Client::connect("postgres://postgres:postgres@localhost", NoTls).unwrap();
+        let mut trans = conn.transaction().unwrap();
         let oid = trans.create_large_object().unwrap();
         let lo = trans.open_large_object(oid, Mode::Read).unwrap();
         lo.finish().unwrap();
@@ -310,11 +292,13 @@ mod test {
     fn test_write_read() {
         use std::io::{Read, Write};
 
-        let conn = Connection::connect("postgres://postgres@localhost", TlsMode::None).unwrap();
-        let trans = conn.transaction().unwrap();
+        let mut conn = Client::connect("postgres://postgres:postgres@localhost", NoTls).unwrap();
+        let mut trans = conn.transaction().unwrap();
         let oid = trans.create_large_object().unwrap();
-        let mut lo = trans.open_large_object(oid, Mode::Write).unwrap();
-        lo.write_all(b"hello world!!!").unwrap();
+        {
+            let mut lo = trans.open_large_object(oid, Mode::Write).unwrap();
+            lo.write_all(b"hello world!!!").unwrap();
+        }
         let mut lo = trans.open_large_object(oid, Mode::Read).unwrap();
         let mut out = vec![];
         lo.read_to_end(&mut out).unwrap();
@@ -325,8 +309,8 @@ mod test {
     fn test_seek_tell() {
         use std::io::{Read, Seek, SeekFrom, Write};
 
-        let conn = Connection::connect("postgres://postgres@localhost", TlsMode::None).unwrap();
-        let trans = conn.transaction().unwrap();
+        let mut conn = Client::connect("postgres://postgres:postgres@localhost", NoTls).unwrap();
+        let mut trans = conn.transaction().unwrap();
         let oid = trans.create_large_object().unwrap();
         let mut lo = trans.open_large_object(oid, Mode::Write).unwrap();
         lo.write_all(b"hello world!!!").unwrap();
@@ -349,8 +333,8 @@ mod test {
     fn test_write_with_read_fd() {
         use std::io::Write;
 
-        let conn = Connection::connect("postgres://postgres@localhost", TlsMode::None).unwrap();
-        let trans = conn.transaction().unwrap();
+        let mut conn = Client::connect("postgres://postgres:postgres@localhost", NoTls).unwrap();
+        let mut trans = conn.transaction().unwrap();
         let oid = trans.create_large_object().unwrap();
         let mut lo = trans.open_large_object(oid, Mode::Read).unwrap();
         assert!(lo.write_all(b"hello world!!!").is_err());
@@ -360,8 +344,8 @@ mod test {
     fn test_truncate() {
         use std::io::{Read, Seek, SeekFrom, Write};
 
-        let conn = Connection::connect("postgres://postgres@localhost", TlsMode::None).unwrap();
-        let trans = conn.transaction().unwrap();
+        let mut conn = Client::connect("postgres://postgres:postgres@localhost", NoTls).unwrap();
+        let mut trans = conn.transaction().unwrap();
         let oid = trans.create_large_object().unwrap();
         let mut lo = trans.open_large_object(oid, Mode::Write).unwrap();
         lo.write_all(b"hello world!!!").unwrap();
@@ -376,14 +360,5 @@ mod test {
         buf.clear();
         lo.read_to_end(&mut buf).unwrap();
         assert_eq!(buf, b"hello\0\0\0\0\0");
-    }
-
-    #[test]
-    fn test_parse_version() {
-        let version = parse_version("10.3 (Debian 10.3-1.pgdg90+1)");
-        assert_eq!(version, (10, 3));
-
-        let version = parse_version("9.5");
-        assert_eq!(version, (9, 5));
     }
 }
