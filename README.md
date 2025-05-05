@@ -6,6 +6,8 @@
 
 A crate providing access to the Postgres large object API.
 
+This version uses the async tokio-postgres
+
 # Example
 
 ```rust
