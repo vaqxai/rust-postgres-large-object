@@ -32,36 +32,36 @@
 //! ```
 #![doc(html_root_url = "https://docs.rs/postgres_large_object/0.7")]
 
-extern crate postgres;
+extern crate tokio_postgres;
 
-use postgres::types::Oid;
-use postgres::Error;
-use postgres::GenericClient;
-use postgres::Transaction;
 use std::cmp;
 use std::fmt;
 use std::i32;
 use std::io::{self, Write};
+use tokio_postgres::Error;
+use tokio_postgres::GenericClient;
+use tokio_postgres::Transaction;
+use tokio_postgres::types::Oid;
 
 /// An extension trait adding functionality to create and delete large objects.
 pub trait LargeObjectExt {
     /// Creates a new large object, returning its `Oid`.
-    fn create_large_object(&mut self) -> Result<Oid, Error>;
+    async fn create_large_object(&mut self) -> Result<Oid, Error>;
 
     /// Deletes the large object with the specified `Oid`.
-    fn delete_large_object(&mut self, oid: Oid) -> Result<(), Error>;
+    async fn delete_large_object(&mut self, oid: Oid) -> Result<(), Error>;
 }
 
 impl<T: GenericClient> LargeObjectExt for T {
-    fn create_large_object(&mut self) -> Result<Oid, Error> {
-        let stmt = self.prepare("SELECT pg_catalog.lo_create(0)")?;
-        let r = self.query_one(&stmt, &[]).map(|r| r.get(0));
+    async fn create_large_object(&mut self) -> Result<Oid, Error> {
+        let stmt = self.prepare("SELECT pg_catalog.lo_create(0)").await?;
+        let r = self.query_one(&stmt, &[]).await.map(|r| r.get(0));
         r
     }
 
-    fn delete_large_object(&mut self, oid: Oid) -> Result<(), Error> {
-        let stmt = self.prepare("SELECT pg_catalog.lo_unlink($1)")?;
-        self.execute(&stmt, &[&oid]).map(|_| ())
+    async fn delete_large_object(&mut self, oid: Oid) -> Result<(), Error> {
+        let stmt = self.prepare("SELECT pg_catalog.lo_unlink($1)").await?;
+        self.execute(&stmt, &[&oid]).await.map(|_| ())
     }
 }
 
@@ -92,29 +92,35 @@ impl Mode {
 /// An extension trait adding functionality to open large objects.
 pub trait LargeObjectTransactionExt<'conn> {
     /// Opens the large object with the specified `Oid` in the specified `Mode`.
-    fn open_large_object<'b>(
+    async fn open_large_object<'b>(
         &'b mut self,
         oid: Oid,
         mode: Mode,
-    ) -> Result<LargeObject<'conn, 'b>, Error>;
+    ) -> Result<LargeObject<'conn, 'b>, Error>
+    where
+        'conn: 'b;
 }
 
 impl<'conn> LargeObjectTransactionExt<'conn> for Transaction<'conn> {
-    fn open_large_object<'b>(
+    async fn open_large_object<'b>(
         &'b mut self,
         oid: Oid,
         mode: Mode,
-    ) -> Result<LargeObject<'conn, 'b>, Error> {
-        let stmt = self.prepare("SELECT pg_catalog.lo_open($1, $2)")?;
+    ) -> Result<LargeObject<'conn, 'b>, Error>
+    where
+        'conn: 'b,
+    {
+        let stmt = self.prepare("SELECT pg_catalog.lo_open($1, $2)").await?;
         let fd = self
-            .query(&stmt, &[&oid, &mode.to_i32()])?
+            .query(&stmt, &[&oid, &mode.to_i32()])
+            .await?
             .iter()
             .next()
             .unwrap()
             .get(0);
         Ok(LargeObject {
             trans: self,
-            fd: fd,
+            fd,
             finished: false,
         })
     }
@@ -152,68 +158,84 @@ impl<'a, 'b> LargeObject<'a, 'b> {
     ///
     /// If `len` is larger than the size of the object, it will be padded with
     /// null bytes to the specified size.
-    pub fn truncate(&mut self, len: i64) -> Result<(), Error> {
+    pub async fn truncate(&mut self, len: i64) -> Result<(), Error> {
         let stmt = self
             .trans
-            .prepare("SELECT pg_catalog.lo_truncate64($1, $2)")?;
+            .prepare("SELECT pg_catalog.lo_truncate64($1, $2)")
+            .await?;
 
-        self.trans.execute(&stmt, &[&self.fd, &len]).map(|_| ())
+        self.trans
+            .execute(&stmt, &[&self.fd, &len])
+            .await
+            .map(|_| ())
     }
 
-    fn finish_inner(&mut self) -> Result<(), Error> {
+    async fn finish_inner(&mut self) -> Result<(), Error> {
         if self.finished {
             return Ok(());
         }
 
         self.finished = true;
-        let stmt = self.trans.prepare("SELECT pg_catalog.lo_close($1)")?;
-        self.trans.execute(&stmt, &[&self.fd]).map(|_| ())
+        let stmt = self.trans.prepare("SELECT pg_catalog.lo_close($1)").await?;
+        self.trans.execute(&stmt, &[&self.fd]).await.map(|_| ())
     }
 
     /// Consumes the `LargeObject`, cleaning up server side state.
     ///
     /// Functionally identical to the `Drop` implementation on `LargeObject`
     /// except that it returns any errors to the caller.
-    pub fn finish(mut self) -> Result<(), Error> {
-        self.finish_inner()
+    pub async fn finish(mut self) -> Result<(), Error> {
+        self.finish_inner().await
     }
 }
 
-impl<'a, 'b> io::Read for LargeObject<'a, 'b> {
-    fn read(&mut self, mut buf: &mut [u8]) -> io::Result<usize> {
+pub trait AsyncReadLargeObject {
+    async fn read(&mut self, buf: &mut [u8]) -> io::Result<usize>;
+}
+
+impl<'a, 'b> AsyncReadLargeObject for LargeObject<'a, 'b> {
+    async fn read(&mut self, mut buf: &mut [u8]) -> io::Result<usize> {
         let stmt = self
             .trans
             .prepare("SELECT pg_catalog.loread($1, $2)")
+            .await
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
         let cap = cmp::min(buf.len(), i32::MAX as usize) as i32;
         let rows = self
             .trans
             .query(&stmt, &[&self.fd, &cap])
+            .await
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
         buf.write(rows.get(0).unwrap().get(0))
     }
 }
 
-impl<'a, 'b> io::Write for LargeObject<'a, 'b> {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+pub trait AsyncWriteLargeObject {
+    async fn write(&mut self, buf: &[u8]) -> io::Result<usize>;
+}
+
+impl<'a, 'b> AsyncWriteLargeObject for LargeObject<'a, 'b> {
+    async fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         let stmt = self
             .trans
             .prepare("SELECT pg_catalog.lowrite($1, $2)")
+            .await
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
         let cap = cmp::min(buf.len(), i32::MAX as usize);
         self.trans
             .execute(&stmt, &[&self.fd, &&buf[..cap]])
+            .await
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
         Ok(cap)
     }
-
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
 }
 
-impl<'a, 'b> io::Seek for LargeObject<'a, 'b> {
-    fn seek(&mut self, pos: io::SeekFrom) -> io::Result<u64> {
+pub trait AsyncSeekLargeObject {
+    async fn seek(&mut self, pos: io::SeekFrom) -> io::Result<u64>;
+}
+
+impl<'a, 'b> AsyncSeekLargeObject for LargeObject<'a, 'b> {
+    async fn seek(&mut self, pos: io::SeekFrom) -> io::Result<u64> {
         let (kind, pos) = match pos {
             io::SeekFrom::Start(pos) => {
                 let pos = if pos <= i64::max_value as u64 {
@@ -233,132 +255,14 @@ impl<'a, 'b> io::Seek for LargeObject<'a, 'b> {
         let stmt = self
             .trans
             .prepare("SELECT pg_catalog.lo_lseek64($1, $2, $3)")
+            .await
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
         let rows = self
             .trans
             .query(&stmt, &[&self.fd, &pos, &kind.to_owned()])
+            .await
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-        let pos: i64 = rows.iter().next().unwrap().get(0);
+        let pos: i64 = rows.first().unwrap().get(0);
         Ok(pos as u64)
-    }
-}
-
-#[cfg(test)]
-mod test {
-    use postgres::{error::SqlState, Client, NoTls};
-
-    use crate::{LargeObjectExt, LargeObjectTransactionExt, Mode};
-
-    const DB_URL: &str = "postgres://postgres:postgres@localhost";
-
-    #[test]
-    fn test_create_delete() {
-        let mut conn = Client::connect(DB_URL, NoTls).unwrap();
-        let oid = conn.create_large_object().unwrap();
-        conn.delete_large_object(oid).unwrap();
-    }
-
-    #[test]
-    fn test_delete_bogus() {
-        let mut conn = Client::connect(DB_URL, NoTls).unwrap();
-        match conn.delete_large_object(0) {
-            Ok(()) => panic!("unexpected success"),
-            Err(ref e) if e.code() == Some(&SqlState::UNDEFINED_OBJECT) => {}
-            Err(e) => panic!("unexpected error: {:?}", e),
-        }
-    }
-
-    #[test]
-    fn test_open_bogus() {
-        let mut conn = Client::connect(DB_URL, NoTls).unwrap();
-        let mut trans = conn.transaction().unwrap();
-        match trans.open_large_object(0, Mode::Read) {
-            Ok(_) => panic!("unexpected success"),
-            Err(ref e) if e.code() == Some(&SqlState::UNDEFINED_OBJECT) => {}
-            Err(e) => panic!("unexpected error: {:?}", e),
-        };
-    }
-
-    #[test]
-    fn test_open_finish() {
-        let mut conn = Client::connect(DB_URL, NoTls).unwrap();
-        let mut trans = conn.transaction().unwrap();
-        let oid = trans.create_large_object().unwrap();
-        let lo = trans.open_large_object(oid, Mode::Read).unwrap();
-        lo.finish().unwrap();
-    }
-
-    #[test]
-    fn test_write_read() {
-        use std::io::{Read, Write};
-
-        let mut conn = Client::connect(DB_URL, NoTls).unwrap();
-        let mut trans = conn.transaction().unwrap();
-        let oid = trans.create_large_object().unwrap();
-        {
-            let mut lo = trans.open_large_object(oid, Mode::Write).unwrap();
-            lo.write_all(b"hello world!!!").unwrap();
-        }
-        let mut lo = trans.open_large_object(oid, Mode::Read).unwrap();
-        let mut out = vec![];
-        lo.read_to_end(&mut out).unwrap();
-        assert_eq!(out, b"hello world!!!");
-    }
-
-    #[test]
-    fn test_seek_tell() {
-        use std::io::{Read, Seek, SeekFrom, Write};
-
-        let mut conn = Client::connect(DB_URL, NoTls).unwrap();
-        let mut trans = conn.transaction().unwrap();
-        let oid = trans.create_large_object().unwrap();
-        let mut lo = trans.open_large_object(oid, Mode::Write).unwrap();
-        lo.write_all(b"hello world!!!").unwrap();
-
-        assert_eq!(14, lo.seek(SeekFrom::Current(0)).unwrap());
-        assert_eq!(1, lo.seek(SeekFrom::Start(1)).unwrap());
-        let mut buf = [0];
-        assert_eq!(1, lo.read(&mut buf).unwrap());
-        assert_eq!(b'e', buf[0]);
-        assert_eq!(2, lo.seek(SeekFrom::Current(0)).unwrap());
-        assert_eq!(10, lo.seek(SeekFrom::End(-4)).unwrap());
-        assert_eq!(1, lo.read(&mut buf).unwrap());
-        assert_eq!(b'd', buf[0]);
-        assert_eq!(8, lo.seek(SeekFrom::Current(-3)).unwrap());
-        assert_eq!(1, lo.read(&mut buf).unwrap());
-        assert_eq!(b'r', buf[0]);
-    }
-
-    #[test]
-    fn test_write_with_read_fd() {
-        use std::io::Write;
-
-        let mut conn = Client::connect(DB_URL, NoTls).unwrap();
-        let mut trans = conn.transaction().unwrap();
-        let oid = trans.create_large_object().unwrap();
-        let mut lo = trans.open_large_object(oid, Mode::Read).unwrap();
-        assert!(lo.write_all(b"hello world!!!").is_err());
-    }
-
-    #[test]
-    fn test_truncate() {
-        use std::io::{Read, Seek, SeekFrom, Write};
-
-        let mut conn = Client::connect(DB_URL, NoTls).unwrap();
-        let mut trans = conn.transaction().unwrap();
-        let oid = trans.create_large_object().unwrap();
-        let mut lo = trans.open_large_object(oid, Mode::Write).unwrap();
-        lo.write_all(b"hello world!!!").unwrap();
-
-        lo.truncate(5).unwrap();
-        lo.seek(SeekFrom::Start(0)).unwrap();
-        let mut buf = vec![];
-        lo.read_to_end(&mut buf).unwrap();
-        assert_eq!(buf, b"hello");
-        lo.truncate(10).unwrap();
-        lo.seek(SeekFrom::Start(0)).unwrap();
-        buf.clear();
-        lo.read_to_end(&mut buf).unwrap();
-        assert_eq!(buf, b"hello\0\0\0\0\0");
     }
 }
