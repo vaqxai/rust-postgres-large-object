@@ -7,7 +7,7 @@ description = "Large object support for rust-postgres"
 repository = "https://github.com/sfackler/rust-postgres-large-object"
 readme = "README.md"
 keywords = ["database", "sql", "postgres"]
-edition = "2024"
+edition = "2021"
 
 [dependencies]
 tokio-postgres = "0.7.13"
